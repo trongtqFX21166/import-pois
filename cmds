@@ -1,0 +1,71 @@
+mongoimport --username=root --password=example --authenticationDatabase=admin --uri="mongodb://localhost:27017/VMChargerDB" --collection=charger --file=poi_gasstation.json
+
+
+# fun file js
+mongosh --username root --password example < initCollections.js
+
+
+
+mongoimport --username=root --password=example --authenticationDatabase=admin --db 20241104  --collection=charger --file=poi_tramsac_sample.json
+
+
+mongoimport --username=root --password=example --authenticationDatabase=admin --db 20241104  --collection=POI_Nearby --file=POI_Nearby_20241028.json --jsonArray
+mongoimport --username=root --password=example --authenticationDatabase=admin --db 20241104  --collection=EntryPoint_Nearby --file=EntryPoint_Nearby_20241028.json --jsonArray
+mongosh --username root --password example < initCollectionsCharger.js
+
+
+# import vm categories
+mongoimport --username=root --password=example --authenticationDatabase=admin  --type csv --file vietmap_poi_categories.csv --headerline --db 20241104 --collection categories
+
+mongoimport --username=root --password=example --authenticationDatabase=admin  --type csv --file AdminData.csv --headerline --db 20241104 --collection admin_raw
+
+mongosh "mongodb://localhost:27017/20241104" --username root --password example --authenticationDatabase=admin  < initCollectionsPOI.js
+
+mongosh "mongodb://localhost:27017/20241104" --username root --password example --authenticationDatabase=admin  < initAdmin.js
+
+
+
+
+
+# Dev ENV
+mongoimport --username=admin --password=hGm9xPFmnbCWsuwr73NM --authenticationDatabase=admin --db VMPOIRawDB --collection=charger --file=poi_tramsac_sample.json
+mongoimport --username=admin --password=hGm9xPFmnbCWsuwr73NM --authenticationDatabase=admin  --type csv --file vietmap_poi_categories.csv --headerline --db VMPOIRawDB --collection categories
+
+mongosh --username=admin --password=hGm9xPFmnbCWsuwr73NM --eval "var databaseName='VML'" < initCollectionsCharger.js
+
+
+# Prod ENV
+mongoimport --username=root --password=p@ssw0rd --authenticationDatabase=admin --db VMPOIRawDB --collection=charger --file=poi_tramsac_sample.json
+mongoimport --username=root --password=p@ssw0rd --authenticationDatabase=admin  --type csv --file vietmap_poi_categories.csv --headerline --db VMPOIRawDB --collection categories
+
+mongosh --username=root --password=p@ssw0rd --eval "var databaseName='VML'" --file D://initCollectionsCharger.js
+
+mongoimport --username=admin --password=hGm9xPFmnbCWsuwr73NM --authenticationDatabase=admin --db GoogleDB  --collection=CrawlerGoogle --file=GoogleDB.CrawlerGoogle.json --jsonArray
+
+
+db.CrawlerGoogle.createIndex({ placeId: 1 }, { unique: true })
+
+db.CrawlerGoogle.aggregate([
+  { $group: { _id: "$placeId", ids: { $push: "$_id" }, count: { $sum: 1 } } },
+  { $match: { count: { $gt: 1 } } }
+]).forEach(function(doc) {
+  doc.ids.shift(); // Keep one document
+  db.CrawlerGoogle.deleteMany({ _id: { $in: doc.ids } });
+});
+
+
+mongoimport --username=root --password=example --authenticationDatabase=admin --db GoogleDB  --collection=CrawlerGoogleNew --file=dataset_google-places-task-1731494335_2024-11-13_11-33-29-214.json --jsonArray
+
+
+-- copy 
+db.Crawler1.aggregate([
+  { $match: { placeId: { $ne: null } } }, // Match all documents
+  { $addFields: { CrawGgVersionCode: 20241128 } }, // Add new fields
+  { $project: { _id: 0, placeId: 1, searchString: 1, rank: 1, searchPageUrl: 1, searchPageLoadedUrl: 1, isAdvertisement: 1, title: 1, subTitle: 1, description: 1, price: 1, categoryName: 1, address: 1, neighborhood: 1, street: 1, city: 1, postalCode: 1, state: 1, countryCode: 1, website: 1, phone: 1, phoneUnformatted: 1, claimThisBusiness: 1, location: 1, locatedIn: 1, plusCode: 1, menu: 1, totalScore: 1, permanentlyClosed: 1, temporarilyClosed: 1, categories: 1, fid: 1, cid: 1, reviewsCount: 1, reviewsDistribution: 1, imagesCount: 1, imageCategories: 1, scrapedAt: 1, reserveTableUrl: 1, googleFoodUrl: 1, hotelStars: 1, hotelDescription: 1, checkInDate: 1, checkOutDate: 1, similarHotelsNearby: 1, hotelReviewSummary: 1, hotelAds: 1, openingHours: 1, peopleAlsoSearch: 1, placesTags: 1, reviewsTags: 1, additionalInfo: 1, gasPrices: 1, questionsAndAnswers: 1, updatesFromCustomers: 1, ownerUpdates: 1, url: 1, imageUrl: 1, kgmid: 1, webResults: 1, parentPlaceUrl: 1, tableReservationLinks: 1, bookingLinks: 1, orderBy: 1, images: 1, imageUrls: 1, reviews: 1, userPlaceNote: 1, CrawGgVersionCode: 1 } },
+  { $merge: { 
+      into: "CrawlerGoogle", 
+      whenMatched: "replace", // Merge with existing documents
+      whenNotMatched: "insert", // Insert new documents
+      on: "placeId" // Use placeId as the key to check for duplicates
+  }}
+]);

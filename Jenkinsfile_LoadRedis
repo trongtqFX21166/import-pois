@@ -1,0 +1,166 @@
+﻿pipeline {
+    agent {
+        label 'WindowsAgent02'
+    }
+    
+    environment {
+        MONGO_CREDENTIALS_USR = 'root'
+        MONGO_CREDENTIALS_PSW = 'pAssw0rd'
+        TEAMS_WEBHOOK = 'https://vietmapcorp.webhook.office.com/webhookb2/205670f3-463f-4ac3-85f8-f84b9f0da76e@fc2e159c-528b-4132-b3c0-f43226646ad7/JenkinsCI/74682a3b843b46529b662e5d4b85f65e/e1fe988a-0959-44ad-889d-44f6a1637286'
+        CURRENT_DATE = new Date().format('yyyyMMdd')
+        MONGO_PATH = 'D:\\MongoDb\\bin'
+        PYTHON_PATH = 'C:\\Users\\admin\\AppData\\Local\\Programs\\Python\\Python310\\python.exe'
+        WORKSPACE = "${WORKSPACE}\\pois"
+        BUILD_OUTPUT = "${WORKSPACE}\\POIImport\\Platform.IOTHub.ImportPOI.Service\\bin\\Release\\net8.0"
+        SCRIPTS_PATH = "${WORKSPACE}\\POIImport\\Platform.IOTHub.ImportPOI.Service\\MongoImportScripts"
+    }
+
+    parameters {
+        string(name: 'mongoDb', description: 'MongoDB Database Name')
+    }
+    
+    stages {   
+        stage("Clean up") {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage("Clone repo") {
+            steps {
+                bat '''
+                    "C:\\Program Files\\Git\\bin\\bash.exe" -c "git clone ssh://git@bitbucket-ssh.vietmap.vn:7999/HUB/pois.git"
+                '''
+            }
+        }
+
+        stage("Checkout release branch") {
+            steps {
+                dir("pois") {
+                    bat """
+                        "C:\\Program Files\\Git\\bin\\bash.exe" -c "git checkout %release_BRANCH%"
+                    """
+                }              
+            }
+        }       
+
+        stage("Build Solution") {
+            steps {
+                dir("pois") {
+                    bat '''
+                        dotnet restore POIImport\\Platform.IOTHub.ImportPOI.Service\\Platform.IOTHub.ImportPOI.Service.csproj
+                        dotnet build POIImport\\Platform.IOTHub.ImportPOI.Service\\Platform.IOTHub.ImportPOI.Service.csproj -c Release
+                    '''
+                }
+            }
+        }
+
+        stage("Verify Build Output") {
+            steps {
+                script {
+                    def exePath = "${BUILD_OUTPUT}\\Platform.IOTHub.ImportPOI.Service.exe"
+                    if (!fileExists(exePath)) {
+                        error "Build output not found at ${exePath}"
+                    }
+                }
+            }
+        }
+
+        stage('Load POI Index') {
+            steps {
+                script {
+                    bat """
+                        cd "${BUILD_OUTPUT}"
+                        Platform.IOTHub.ImportPOI.Service.exe -mode load-poi -db "${params.mongoDb}"
+                    """
+                }
+            }
+        }
+
+        stage('Load Entry POI Index') {
+            steps {
+                script {
+                    bat """
+                        cd "${BUILD_OUTPUT}"
+                        Platform.IOTHub.ImportPOI.Service.exe -mode load-entry -db "${params.mongoDb}"
+                    """
+                }
+            }
+        }
+
+        stage('Load VF Power Index') {
+            steps {
+                script {
+                    bat """
+                        cd "${BUILD_OUTPUT}"
+                        Platform.IOTHub.ImportPOI.Service.exe -mode load-vfpower -db "${params.mongoDb}"
+                    """
+                }
+            }
+        }
+
+        stage('Monitor Redis Indices') {
+            steps {
+                script {
+                    // Execute Python monitoring script and capture its output
+                    def monitorOutput = bat(
+                        script: """
+                            cd "${SCRIPTS_PATH}"
+                            "${PYTHON_PATH}" redis_monitor.py "${BUILD_NUMBER}" "${currentBuild.durationString}"
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    // Store the output for use in notifications
+                    env.REDIS_MONITOR_OUTPUT = monitorOutput
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            office365ConnectorSend(
+                webhookUrl: "${TEAMS_WEBHOOK}",
+                message: """
+                    **✅ Load POIS to Redis Successful**
+                    - Build: ${BUILD_NUMBER}
+                    - Database: ${params.mongoDb}
+                    - Date: ${CURRENT_DATE}
+                    - Duration: ${currentBuild.durationString}
+                    - Status: All Redis indices loaded successfully
+                    
+                    **Redis Monitoring Results:**
+                    ${env.REDIS_MONITOR_OUTPUT ?: 'Monitoring data not available'}
+                    
+                    [View Build Details](${BUILD_URL})
+                """,
+                color: '00ff00'
+            )
+        }
+        
+        failure {
+            office365ConnectorSend(
+                webhookUrl: "${TEAMS_WEBHOOK}",
+                message: """
+                    **❌ Load POIS to Redis Failed**
+                    - Build: ${BUILD_NUMBER}
+                    - Database: ${params.mongoDb}
+                    - Date: ${CURRENT_DATE}
+                    - Duration: ${currentBuild.durationString}
+                    - Failed Stage: ${currentBuild.displayName}
+                    
+                    [View Logs](${BUILD_URL}console)
+                """,
+                color: 'ff0000'
+            )
+        }
+
+        always {
+            cleanWs(cleanWhenNotBuilt: false,
+                   deleteDirs: true,
+                   disableDeferredWipeout: true,
+                   notFailBuild: true)
+        }
+    }
+}

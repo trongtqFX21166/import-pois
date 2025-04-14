@@ -1,0 +1,466 @@
+﻿pipeline {
+    agent {
+        label 'WindowsAgent02'
+    }
+    
+    parameters {
+        string(name: 'prevMongoDb', description: 'Previous MongoDB Database Name')
+        string(name: 'newMongoDb', description: 'New MongoDB Database Name')
+    }
+    
+    environment {
+        MONGO_CREDENTIALS_USR = 'root'
+        MONGO_CREDENTIALS_PSW = 'pAssw0rd'
+        TEAMS_WEBHOOK = 'https://vietmapcorp.webhook.office.com/webhookb2/205670f3-463f-4ac3-85f8-f84b9f0da76e@fc2e159c-528b-4132-b3c0-f43226646ad7/JenkinsCI/74682a3b843b46529b662e5d4b85f65e/e1fe988a-0959-44ad-889d-44f6a1637286'
+        MONGO_PATH = 'D:\\MongoDb\\bin'
+        FTP_PATH = 'D:\\FTP\\POIRaw'
+        MONGO_IMPORT_SCRIPT_PATH = "POIImport\\Platform.IOTHub.ImportPOI.Service\\MongoImportScripts"
+    }
+    
+    stages {
+
+        stage("Clean up") {
+            steps {
+                powershell '''
+                    Write-Host "Cleaning up workspace..."
+                    Remove-Item -Path * -Recurse -Force -ErrorAction SilentlyContinue
+                '''
+            }
+        }
+
+        stage("Clone repo") {
+            steps {
+                bat '''
+                    "C:\\Program Files\\Git\\bin\\bash.exe" -c "git clone ssh://git@bitbucket-ssh.vietmap.vn:7999/HUB/pois.git"
+                '''
+            }
+        }
+
+        stage("Checkout repo") {
+            steps {
+                dir("pois") {
+                    bat '''
+                        "C:\\Program Files\\Git\\bin\\bash.exe" -c "git checkout %RELEASE_BRANCH%"
+                    '''
+                }              
+            }
+        }  
+
+        stage('Validate Input Data') {
+            steps {
+                script {
+                    powershell '''
+                        try {
+                            $prevMongoDb = $env:prevMongoDb
+                            $newMongoDb = $env:newMongoDb
+                            function Test-FolderExists {
+                                param([string]$path)
+                                return (Test-Path -Path $path)
+                            }
+
+                            function Test-JsonFiles {
+                                param([string]$path)
+                                $inputFiles = @(
+                                    'POI_Nearby_raw.json',
+                                    'POI_Nearby_diff.json',
+                                    'EntryPoint_Nearby_raw.json',
+                                    'EntryPoint_Nearby_diff.json'
+                                )
+
+                                Write-Host "Expected file location: $path"
+                                foreach ($file in $inputFiles) {
+                                    $filePath = Join-Path $path $file
+                                    Write-Host "Checking file: $filePath"
+                                }
+
+                                Write-Host "Checking JSON files in: $path"
+                                foreach ($file in $inputFiles) {
+                                    $filePath = Join-Path $path $file
+                                    Write-Host "Checking file: $filePath"
+
+                                    if (-not (Test-Path $filePath)) {
+                                        throw "File not found: $file"
+                                    }
+
+                                    try {
+                                        Get-Content $filePath -Raw | ConvertFrom-Json | Out-Null
+                                        Write-Host "Successfully validated: $file"
+                                    } catch {
+                                        throw "Invalid JSON in $file"
+                                    }
+                                }
+                                return $true
+                            }
+
+                            function Test-DatabaseExists {
+                                param([string]$databaseName)
+                                try {
+                                    Write-Host "Checking database: $databaseName"
+                                    $cmd = "$env:MONGO_PATH\\mongosh.exe"
+                                    Write-Host "Executing: $cmd"
+
+                                    $result = & $cmd `
+                                        "mongodb://localhost:27017" `
+                                        --username="$env:MONGO_CREDENTIALS_USR" `
+                                        --password="$env:MONGO_CREDENTIALS_PSW" `
+                                        --authenticationDatabase=admin `
+                                        --quiet `
+                                        --eval "db.getMongo().getDBNames().includes('$databaseName')"
+
+                                    return [System.Convert]::ToBoolean($result)
+                                } catch {
+                                    throw "MongoDB connection failed: $($_.Exception.Message)"
+                                }
+                            }
+
+                            $inputFolder = Join-Path $env:FTP_PATH $newMongoDb
+                            Write-Host "Required folder structure:"
+                            Write-Host "Root: $env:FTP_PATH"
+                            Write-Host "Target folder: $inputFolder"
+                            Write-Host "Looking for files in: $inputFolder"
+
+                            if (!(Test-FolderExists $inputFolder)) {
+                                throw "Input folder does not exist: $inputFolder"
+                            }
+
+                            if (!(Test-JsonFiles $inputFolder)) {
+                                throw "JSON validation failed"
+                            }
+
+                            if (!(Test-DatabaseExists $prevMongoDb)) {
+                                throw "Previous database $prevMongoDb not found"
+                            }
+
+                            Write-Host "Validation completed successfully"
+                        } catch {
+                            Write-Error "$($_.Exception.Message)"
+                            exit 1
+                        }
+                    '''
+                }
+            }
+        }
+
+        stage('Clone Collections') {
+            steps {
+                script {
+                    powershell '''
+                        try {
+                            $prevMongoDb = $env:prevMongoDb
+                            $newMongoDb = $env:newMongoDb
+                            Write-Host "Starting collections cloning..."
+                            $collections = @('POI_Nearby', 'EntryPoint_Nearby', 'categories')
+
+                            foreach ($collection in $collections) {
+                                Write-Host "Cloning collection: $collection"
+                                $cmd = "$env:MONGO_PATH\\mongosh.exe"
+                                
+                                $evalCmd = "db.getSiblingDB('$newMongoDb').$collection.drop(); db.getSiblingDB('$prevMongoDb').$collection.find({ `$or: [ { status: { `$exists: false } }, { status: { `$ne: 'delete' } } ] }).forEach(function(doc) { doc.status = 'none'; db.getSiblingDB('$newMongoDb').$collection.insert(doc); });"
+
+                                Write-Host "Executing: $cmd"
+                                Write-Host "Eval command: $evalCmd"
+
+                                & $cmd `
+                                    --username="$env:MONGO_CREDENTIALS_USR" `
+                                    --password="$env:MONGO_CREDENTIALS_PSW" `
+                                    --authenticationDatabase=admin `
+                                    --eval $evalCmd
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "Failed to clone $collection"
+                                }
+                                Write-Host "Successfully cloned: $collection"
+                            }
+                        } catch {
+                            Write-Error "$($_.Exception.Message)"
+                            exit 1
+                        }
+                    '''
+                }
+            }
+        }
+
+        stage('Import Changes Data') {
+            steps {
+                script {
+                    def importSteps = [
+                        { 
+                            // Import POI Nearby Raw
+                            powershell '''
+                            try {
+                                $newMongoDb = $env:newMongoDb
+                                $inputFolder = Join-Path $env:FTP_PATH $newMongoDb
+                                Write-Host "Starting POI Nearby Raw import..."
+                                & "$env:MONGO_PATH\\mongoimport.exe" `
+                                    --username="$env:MONGO_CREDENTIALS_USR" `
+                                    --password="$env:MONGO_CREDENTIALS_PSW" `
+                                    --authenticationDatabase=admin `
+                                    --db="$newMongoDb" `
+                                    --collection=POI_Nearby_Raw `
+                                    --file="$inputFolder\\POI_Nearby_raw.json" `
+                                    --jsonArray
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "POI Nearby Raw import failed with exit code $LASTEXITCODE"
+                                }
+                                Write-Host "POI Nearby Raw import completed successfully"
+                            } catch {
+                                Write-Error "$($_.Exception.Message)"
+                                exit 1
+                            }
+                            '''
+                        },
+                        { 
+                            // Import POI Nearby Diff
+                            powershell '''
+                            try {
+                                $newMongoDb = $env:newMongoDb
+                                $inputFolder = Join-Path $env:FTP_PATH $newMongoDb
+                                Write-Host "Starting POI Nearby Diff import..."
+                                & "$env:MONGO_PATH\\mongoimport.exe" `
+                                    --username="$env:MONGO_CREDENTIALS_USR" `
+                                    --password="$env:MONGO_CREDENTIALS_PSW" `
+                                    --authenticationDatabase=admin `
+                                    --db="$newMongoDb" `
+                                    --collection=POI_Nearby_Diff `
+                                    --file="$inputFolder\\POI_Nearby_diff.json" `
+                                    --jsonArray
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "POI Nearby Diff import failed with exit code $LASTEXITCODE"
+                                }
+                                Write-Host "POI Nearby Diff import completed successfully"
+                            } catch {
+                                Write-Error "$($_.Exception.Message)"
+                                exit 1
+                            }
+                            '''
+                        },
+                        { 
+                            // Import EntryPoint Nearby Raw
+                            powershell '''
+                            try {
+                                $newMongoDb = $env:newMongoDb
+                                $inputFolder = Join-Path $env:FTP_PATH $newMongoDb
+                                Write-Host "Starting EntryPoint Nearby Raw import..."
+                                & "$env:MONGO_PATH\\mongoimport.exe" `
+                                    --username="$env:MONGO_CREDENTIALS_USR" `
+                                    --password="$env:MONGO_CREDENTIALS_PSW" `
+                                    --authenticationDatabase=admin `
+                                    --db="$newMongoDb" `
+                                    --collection=EntryPoint_Nearby_Raw `
+                                    --file="$inputFolder\\EntryPoint_Nearby_raw.json" `
+                                    --jsonArray
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "EntryPoint Nearby Raw import failed with exit code $LASTEXITCODE"
+                                }
+                                Write-Host "EntryPoint Nearby Raw import completed successfully"
+                            } catch {
+                                Write-Error "$($_.Exception.Message)"
+                                exit 1
+                            }
+                            '''
+                        },
+                        { 
+                            // Import EntryPoint Nearby Diff
+                            powershell '''
+                            try {
+                                $newMongoDb = $env:newMongoDb
+                                $inputFolder = Join-Path $env:FTP_PATH $newMongoDb
+                                Write-Host "Starting EntryPoint Nearby Diff import..."
+                                & "$env:MONGO_PATH\\mongoimport.exe" `
+                                    --username="$env:MONGO_CREDENTIALS_USR" `
+                                    --password="$env:MONGO_CREDENTIALS_PSW" `
+                                    --authenticationDatabase=admin `
+                                    --db="$newMongoDb" `
+                                    --collection=EntryPoint_Nearby_Diff `
+                                    --file="$inputFolder\\EntryPoint_Nearby_diff.json" `
+                                    --jsonArray
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "EntryPoint Nearby Diff import failed with exit code $LASTEXITCODE"
+                                }
+                                Write-Host "EntryPoint Nearby Diff import completed successfully"
+                            } catch {
+                                Write-Error "$($_.Exception.Message)"
+                                exit 1
+                            }
+                            '''
+                        }
+                    ]
+
+                    importSteps.each { step ->
+                        step()
+                    }
+                }
+            }
+        }
+        
+        stage('Process Changes') {
+            steps {
+                dir("pois")
+                {
+                    script {
+                        powershell '''
+                            try {
+                                $newMongoDb = $env:newMongoDb
+                                Write-Host "Starting changes processing..."
+                                $scripts = @(
+                                    'updatePOINearBy.js',
+                                    'updateEntryPOINearBy.js'
+                                )
+
+                                foreach ($script in $scripts) {
+                                    Write-Host "Processing script: $script"
+                                    $scriptPath = Join-Path $env:MONGO_IMPORT_SCRIPT_PATH $script
+
+                                    $cmd = "$env:MONGO_PATH\\mongosh.exe"
+                                    Write-Host "Executing: $cmd"
+                                    Write-Host "Script path: $scriptPath"
+
+                                    & $cmd `
+                                        --username="$env:MONGO_CREDENTIALS_USR" `
+                                        --password="$env:MONGO_CREDENTIALS_PSW" `
+                                        --authenticationDatabase=admin `
+                                        "$newMongoDb" `
+                                        "$scriptPath"
+
+                                    if ($LASTEXITCODE -ne 0) {
+                                        throw "Failed to execute $script"
+                                    }
+                                    Write-Host "Successfully executed: $script"
+                                }
+                            } catch {
+                                Write-Error "$($_.Exception.Message)"
+                                exit 1
+                            }
+                        '''
+                    }
+                }
+
+            }
+        }
+
+        stage('Data Transformation') {
+            steps {
+                dir("pois"){
+                    script {
+                        def transformationSteps = [
+                            { 
+                                powershell '''
+                                try {
+                                    Write-Host "Starting POI transformation..."
+                                    & "$env:MONGO_PATH\\mongosh.exe" `
+                                        "mongodb://localhost:27017/$env:newMongoDb" `
+                                        --username="$env:MONGO_CREDENTIALS_USR" `
+                                        --password="$env:MONGO_CREDENTIALS_PSW" `
+                                        --authenticationDatabase=admin `
+                                        --eval "var database=$env:newMongoDb" `
+                                        --file "$env:MONGO_IMPORT_SCRIPT_PATH\\initCollectionsPOI.js"
+
+                                    if ($LASTEXITCODE -ne 0) {
+                                        throw "POI transformation failed with exit code $LASTEXITCODE"
+                                    }
+                                    Write-Host "POI transformation completed successfully"
+                                } catch {
+                                    Write-Error "$($_.Exception.Message)"
+                                    exit 1
+                                }
+                                '''
+                            },
+                            { 
+                                powershell '''
+                                try {
+                                    Write-Host "Starting Admin transformation..."
+                                    & "$env:MONGO_PATH\\mongosh.exe" `
+                                        "mongodb://localhost:27017/$env:newMongoDb" `
+                                        --username="$env:MONGO_CREDENTIALS_USR" `
+                                        --password="$env:MONGO_CREDENTIALS_PSW" `
+                                        --authenticationDatabase=admin `
+                                        --eval "var database=$env:newMongoDb" `
+                                        --file "$env:MONGO_IMPORT_SCRIPT_PATH\\initAdmin.js"
+
+                                    if ($LASTEXITCODE -ne 0) {
+                                        throw "Admin transformation failed with exit code $LASTEXITCODE"
+                                    }
+                                    Write-Host "Admin transformation completed successfully"
+                                } catch {
+                                    Write-Error "$($_.Exception.Message)"
+                                    exit 1
+                                }
+                                '''
+                            },
+                            { 
+                                powershell '''
+                                try {
+                                    Write-Host "Starting Admin transformation..."
+                                    & "$env:MONGO_PATH\\mongosh.exe" `
+                                        "mongodb://localhost:27017/$env:newMongoDb" `
+                                        --username="$env:MONGO_CREDENTIALS_USR" `
+                                        --password="$env:MONGO_CREDENTIALS_PSW" `
+                                        --authenticationDatabase=admin `
+                                        --eval "var database=$env:newMongoDb" `
+                                        --file "$env:MONGO_IMPORT_SCRIPT_PATH\\replaceVmEntryPoi.js"
+
+                                    if ($LASTEXITCODE -ne 0) {
+                                        throw "Admin transformation failed with exit code $LASTEXITCODE"
+                                    }
+                                    Write-Host "Admin transformation completed successfully"
+                                } catch {
+                                    Write-Error "$($_.Exception.Message)"
+                                    exit 1
+                                }
+                                '''
+                            }
+                        ]
+                        
+                        transformationSteps.each { step ->
+                            step()
+                        }
+                    }
+                }
+
+            }        
+        }
+    }
+    
+    post {
+        success {
+            office365ConnectorSend(
+                webhookUrl: "${TEAMS_WEBHOOK}",
+                message: """
+                    **✅ ETL Map POI Extract & Transform Successful**
+                    - Previous Database: ${params.prevMongoDb}
+                    - New Database: ${params.newMongoDb}
+                    - Build: ${BUILD_NUMBER}
+                    - Duration: ${currentBuild.durationString}
+                    
+                    [View Build Details](${BUILD_URL})
+                """,
+                color: '00ff00'
+            )
+        }
+        
+        failure {
+            office365ConnectorSend(
+                webhookUrl: "${TEAMS_WEBHOOK}",
+                message: """
+                    **❌ ETL Map POI Extract & Transform Failed**
+                    - Previous Database: ${params.prevMongoDb}
+                    - New Database: ${params.newMongoDb}
+                    - Build: ${BUILD_NUMBER}
+                    - Failed Stage: ${currentBuild.displayName}
+                    - Duration: ${currentBuild.durationString}
+                    
+                    [View Logs](${BUILD_URL}console)
+                """,
+                color: 'ff0000'
+            )
+        }
+        
+        always {
+            cleanWs()
+        }
+    }
+}
