@@ -1,0 +1,122 @@
+﻿pipeline {
+    agent {
+        label 'WindowsAgent02'
+    }
+    
+    environment {
+        MONGO_CREDENTIALS_USR = 'root'
+        MONGO_CREDENTIALS_PSW = 'pAssw0rd'
+        TEAMS_WEBHOOK = 'https://vietmapcorp.webhook.office.com/webhookb2/205670f3-463f-4ac3-85f8-f84b9f0da76e@fc2e159c-528b-4132-b3c0-f43226646ad7/JenkinsCI/74682a3b843b46529b662e5d4b85f65e/e1fe988a-0959-44ad-889d-44f6a1637286'
+        CURRENT_DATE = new Date().format('yyyyMMdd')
+        MONGO_PATH = 'D:\\MongoDb\\bin'
+        FTP_PATH = 'D:\\FTP\\POIRaw'
+        WORKSPACE = "${WORKSPACE}\\pois"
+        BUILD_OUTPUT = "${WORKSPACE}\\POIImport\\Platform.IOTHub.ImportPOI.Service\\bin\\Release\\net8.0"
+        RELEASE_BRANCH = "release_1.0.0"
+        MONGODB = "20250208"
+    }
+    
+    stages {   
+        stage("Clean up") {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage("Clone repo") {
+            steps {
+                bat '''
+                    "C:\\Program Files\\Git\\bin\\bash.exe" -c "git clone ssh://git@bitbucket-ssh.vietmap.vn:7999/HUB/pois.git"
+                '''
+            }
+        }
+
+        stage("Checkout release branch") {
+            steps {
+                bat '''
+                    "C:\\Program Files\\Git\\bin\\bash.exe" -c "git checkout ${env.RELEASE_BRANCH}"
+                '''
+            }
+        }        
+
+        stage("Build Solution") {
+            steps {
+                dir("pois") {
+                    bat '''
+                        dotnet restore POIImport\\Platform.IOTHub.ImportPOI.Service\\Platform.IOTHub.ImportPOI.Service.csproj
+                        dotnet build POIImport\\Platform.IOTHub.ImportPOI.Service\\Platform.IOTHub.ImportPOI.Service.csproj -c Release
+                    '''
+                }
+            }
+        }
+
+        stage("Verify Build Output") {
+            steps {
+                script {
+                    def exePath = "${BUILD_OUTPUT}\\Platform.IOTHub.ImportPOI.Service.exe"
+                    if (!fileExists(exePath)) {
+                        error "Build output not found at ${exePath}"
+                    }
+                }
+            }
+        }
+        
+        stage('Sync VF Evse Power') {
+            steps {
+                script {
+                    bat """
+                        cd "${BUILD_OUTPUT}"
+                        Platform.IOTHub.ImportPOI.Service.exe -mode sync-vfpower -db "${env.MONGODB}"
+                    """
+                }
+            }
+        }
+
+        stage('Sync VF Evse Power To Redis') {
+            steps {
+                script {
+                    bat """
+                        cd "${BUILD_OUTPUT}"
+                        Platform.IOTHub.ImportPOI.Service.exe -mode load-vfpower -db "${env.MONGODB}"
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            office365ConnectorSend(
+                webhookUrl: "${TEAMS_WEBHOOK}",
+                message: """
+                    **✅ Sync All Evse Power Process Successful**
+                    - Build: ${BUILD_NUMBER}
+                    - Database: ${params.mongoDb}
+                    - Date: ${CURRENT_DATE}
+                    - Duration: ${currentBuild.durationString}
+                    - Status: Sync All Evse Power Successfully
+                    
+                    [View Build Details](${BUILD_URL})
+                """,
+                color: '00ff00'
+            )
+        }
+        
+        failure {
+            office365ConnectorSend(
+                webhookUrl: "${TEAMS_WEBHOOK}",
+                message: """
+                    **❌ Sync All Evse Power Process Failed**
+                    - Build: ${BUILD_NUMBER}
+                    - Database: ${params.mongoDb}
+                    - Date: ${CURRENT_DATE}
+                    - Duration: ${currentBuild.durationString}
+                    - Failed Stage: ${currentBuild.displayName}
+                    
+                    [View Logs](${BUILD_URL}console)
+                """,
+                color: 'ff0000'
+            )
+        }
+    }
+}
